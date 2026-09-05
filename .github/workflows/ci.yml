@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+      - name: Compile
+        run: |
+          javac -d out $(find src/main/java -name "*.java")
+          javac -cp out -d out $(find src/test/java -name "*.java")
+      - name: Run tests
+        run: |
+          java -cp out dev.kasapdev.retry.RetryTest
