@@ -1,6 +1,6 @@
 # java-retry
 
-[![CI](https://github.com/kasapdev/java-retry/actions/workflows/ci.yml/badge.svg)](https://github.com/kasapdev/java-retry/actions/workflows/ci.yml)
+[![CI](https://github.com/kasapdev/java-retry/actions/workflows/ci.yml/badge.svg)](https://github.com/kasapdev/java-retry/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Java](https://img.shields.io/badge/Java-17-ED8B00?logo=openjdk&logoColor=white)
 
 A small, fluent retry utility for Java with exponential backoff, optional jitter, and selective retrying by exception type. Zero dependencies, pure Java 17, no build tool required.
 
