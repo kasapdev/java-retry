@@ -5,7 +5,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * A small, fluent retry utility with exponential backoff, optional jitter, and
@@ -28,9 +32,15 @@ import java.util.concurrent.ThreadLocalRandom;
  * of those classes are retried; any other exception propagates immediately
  * without consuming a retry or sleeping.
  *
+ * <p>For non-blocking code, {@link #executeAsync(Supplier)} applies the same
+ * backoff/jitter/{@code retryOn} policy to a task that returns a
+ * {@link CompletableFuture} instead of a synchronous result, scheduling each
+ * retry after the computed delay without blocking a thread.
+ *
  * <p>This class is a mutable fluent builder; it is not thread-safe to
- * configure concurrently, but {@link #execute(Callable)} may be called
- * repeatedly (including concurrently) once configuration is complete.
+ * configure concurrently, but {@link #execute(Callable)} and
+ * {@link #executeAsync(Supplier)} may be called repeatedly (including
+ * concurrently) once configuration is complete.
  */
 public final class Retry {
 
@@ -117,6 +127,79 @@ public final class Retry {
                 sleepBeforeRetry(attempt - 1);
             }
         }
+    }
+
+    /**
+     * Executes {@code task} asynchronously, retrying on failure according to this
+     * policy. Unlike {@link #execute(Callable)}, this never blocks the calling
+     * thread: on each attempt, {@code task} is invoked to obtain a
+     * {@link CompletableFuture}; if it completes exceptionally with a retryable
+     * failure (per {@link #retryOn}) and attempts remain, the next attempt is
+     * scheduled after the computed backoff delay using
+     * {@link CompletableFuture#delayedExecutor(long, TimeUnit)} rather than
+     * sleeping a thread.
+     *
+     * @return a future that completes with the task's result on success, or
+     *         completes exceptionally with the last failure once retries are
+     *         exhausted, or immediately if the failure's type is not retryable
+     *         per {@link #retryOn}
+     */
+    public <T> CompletableFuture<T> executeAsync(Supplier<CompletableFuture<T>> task) {
+        CompletableFuture<T> resultFuture = new CompletableFuture<>();
+        attemptAsync(task, 0, resultFuture);
+        return resultFuture;
+    }
+
+    private <T> void attemptAsync(Supplier<CompletableFuture<T>> task, int attempt, CompletableFuture<T> resultFuture) {
+        CompletableFuture<T> attemptFuture;
+        try {
+            attemptFuture = task.get();
+        } catch (Throwable failure) {
+            onAsyncFailure(task, attempt, resultFuture, failure);
+            return;
+        }
+        if (attemptFuture == null) {
+            onAsyncFailure(task, attempt, resultFuture,
+                    new NullPointerException("async task supplier returned a null CompletableFuture"));
+            return;
+        }
+        attemptFuture.whenComplete((value, failure) -> {
+            if (failure == null) {
+                resultFuture.complete(value);
+            } else {
+                onAsyncFailure(task, attempt, resultFuture, unwrapAsyncFailure(failure));
+            }
+        });
+    }
+
+    private <T> void onAsyncFailure(Supplier<CompletableFuture<T>> task, int attempt,
+                                     CompletableFuture<T> resultFuture, Throwable failure) {
+        int nextAttempt = attempt + 1;
+        boolean retryable = isRetryable(failure);
+        boolean exhausted = nextAttempt >= maxAttempts;
+        if (!retryable || exhausted) {
+            resultFuture.completeExceptionally(failure);
+            return;
+        }
+        long delayMillis = computeDelayMillis(nextAttempt - 1);
+        Runnable nextAttemptRunnable = () -> attemptAsync(task, nextAttempt, resultFuture);
+        if (delayMillis > 0) {
+            CompletableFuture.runAsync(nextAttemptRunnable, CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS));
+        } else {
+            nextAttemptRunnable.run();
+        }
+    }
+
+    /**
+     * A {@link CompletableFuture} that fails via an async chain (e.g. {@code supplyAsync})
+     * wraps the real cause in a {@link CompletionException}; unwrap it so {@link #isRetryable}
+     * evaluates the actual failure type, matching how the synchronous path sees it.
+     */
+    private static Throwable unwrapAsyncFailure(Throwable failure) {
+        if (failure instanceof CompletionException && failure.getCause() != null) {
+            return failure.getCause();
+        }
+        return failure;
     }
 
     private boolean isRetryable(Throwable failure) {

@@ -2,7 +2,11 @@ package dev.kasapdev.retry;
 
 import java.time.Duration;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 public final class RetryTest {
 
@@ -34,6 +38,11 @@ public final class RetryTest {
         testRetryOnMatchesSubtypeOfConfiguredException();
         testMaxAttemptsOneMeansNoRetries();
         testErrorPropagatesUnwrappedOnceExhausted();
+        testAsyncSucceedsAfterNFailures();
+        testAsyncNonRetryableExceptionFailsImmediately();
+        testAsyncExhaustsAllAttemptsThenFailsWithLastFailure();
+        testAsyncSuccessOnFirstTryCallsTaskOnce();
+        testAsyncSupplierThrowingSynchronouslyIsTreatedAsFailure();
         TestKit.finish();
     }
 
@@ -339,5 +348,139 @@ public final class RetryTest {
                 elapsedMillis >= expectedMinMillis);
         TestKit.check("backoff test exhausted the configured number of attempts",
                 callCount.get() == maxAttempts);
+    }
+
+    private static void testAsyncSucceedsAfterNFailures() throws Exception {
+        final int failuresBeforeSuccess = 3;
+        AtomicInteger callCount = new AtomicInteger(0);
+
+        // Each invocation returns a fresh CompletableFuture that completes exceptionally
+        // with a retryable exception for the first `failuresBeforeSuccess` invocations,
+        // then completes successfully on invocation N+1.
+        Supplier<CompletableFuture<String>> flakyAsyncTask = () -> {
+            int callNumber = callCount.incrementAndGet();
+            CompletableFuture<String> future = new CompletableFuture<>();
+            if (callNumber <= failuresBeforeSuccess) {
+                future.completeExceptionally(new RetryableException("async attempt " + callNumber + " failed"));
+            } else {
+                future.complete("async-success-on-call-" + callNumber);
+            }
+            return future;
+        };
+
+        // Same short-delay pattern as the sync tests (single-digit millis): this keeps the
+        // test fast and deterministic without any real multi-second wait.
+        Retry retry = Retry.of(failuresBeforeSuccess + 2, Duration.ofMillis(2))
+                .withBackoffMultiplier(2.0)
+                .withJitter(0.0)
+                .retryOn(RetryableException.class);
+
+        CompletableFuture<String> resultFuture = retry.executeAsync(flakyAsyncTask);
+        // Bounded get() is just test-harness synchronization so the process doesn't exit
+        // before the async retries finish; it is not a real multi-second wait.
+        String result = resultFuture.get(5, TimeUnit.SECONDS);
+
+        TestKit.check("async result is correct after eventual success",
+                ("async-success-on-call-" + (failuresBeforeSuccess + 1)).equals(result));
+        TestKit.check("async task was invoked exactly N+1 times (N failures + 1 success)",
+                callCount.get() == failuresBeforeSuccess + 1);
+    }
+
+    private static void testAsyncNonRetryableExceptionFailsImmediately() throws Exception {
+        AtomicInteger callCount = new AtomicInteger(0);
+
+        Supplier<CompletableFuture<String>> task = () -> {
+            callCount.incrementAndGet();
+            CompletableFuture<String> future = new CompletableFuture<>();
+            future.completeExceptionally(new NonRetryableException("async boom"));
+            return future;
+        };
+
+        Retry retry = Retry.of(5, Duration.ofMillis(2))
+                .retryOn(RetryableException.class); // NonRetryableException is not in this list
+
+        CompletableFuture<String> resultFuture = retry.executeAsync(task);
+
+        Throwable caught = null;
+        try {
+            resultFuture.get(5, TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            caught = e.getCause();
+        }
+
+        TestKit.check("async non-retryable exception fails the future immediately",
+                caught instanceof NonRetryableException);
+        TestKit.check("async task with non-retryable exception was invoked exactly once",
+                callCount.get() == 1);
+    }
+
+    private static void testAsyncExhaustsAllAttemptsThenFailsWithLastFailure() throws Exception {
+        AtomicInteger callCount = new AtomicInteger(0);
+        int maxAttempts = 3;
+
+        Supplier<CompletableFuture<String>> alwaysFails = () -> {
+            int callNumber = callCount.incrementAndGet();
+            CompletableFuture<String> future = new CompletableFuture<>();
+            future.completeExceptionally(new RetryableException("always fails, call " + callNumber));
+            return future;
+        };
+
+        Retry retry = Retry.of(maxAttempts, Duration.ofMillis(1))
+                .retryOn(RetryableException.class);
+
+        CompletableFuture<String> resultFuture = retry.executeAsync(alwaysFails);
+
+        Throwable caught = null;
+        try {
+            resultFuture.get(5, TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            caught = e.getCause();
+        }
+
+        TestKit.check("async exhausted retries fails with the last failure",
+                caught instanceof RetryableException);
+        TestKit.check("async exhausted retries invoked the task exactly maxAttempts times",
+                callCount.get() == maxAttempts);
+    }
+
+    private static void testAsyncSuccessOnFirstTryCallsTaskOnce() throws Exception {
+        AtomicInteger callCount = new AtomicInteger(0);
+        Supplier<CompletableFuture<String>> task = () -> {
+            callCount.incrementAndGet();
+            return CompletableFuture.completedFuture("ok");
+        };
+
+        Retry retry = Retry.of(5, Duration.ofMillis(1));
+        CompletableFuture<String> resultFuture = retry.executeAsync(task);
+        String result = resultFuture.get(5, TimeUnit.SECONDS);
+
+        TestKit.check("async immediate success returns correct result", "ok".equals(result));
+        TestKit.check("async immediate success invokes task exactly once (no unnecessary retries)",
+                callCount.get() == 1);
+    }
+
+    private static void testAsyncSupplierThrowingSynchronouslyIsTreatedAsFailure() throws Exception {
+        // A supplier may throw synchronously (before ever producing a CompletableFuture),
+        // e.g. if obtaining the future itself fails. That must be treated the same as an
+        // exceptionally-completed future: retried if retryable, propagated via the result
+        // future once exhausted or non-retryable.
+        AtomicInteger callCount = new AtomicInteger(0);
+        Supplier<CompletableFuture<String>> throwsBeforeReturningFuture = () -> {
+            int callNumber = callCount.incrementAndGet();
+            if (callNumber == 1) {
+                throw new RuntimeException("failed to even start the async call");
+            }
+            return CompletableFuture.completedFuture("recovered-on-call-" + callNumber);
+        };
+
+        // Default policy (no retryOn) treats every Throwable as retryable.
+        Retry retry = Retry.of(3, Duration.ofMillis(2));
+        CompletableFuture<String> resultFuture = retry.executeAsync(throwsBeforeReturningFuture);
+        String result = resultFuture.get(5, TimeUnit.SECONDS);
+
+        TestKit.check("a synchronous throw from the async supplier is retried and recovers",
+                "recovered-on-call-2".equals(result));
+        TestKit.check("supplier throwing synchronously counted as an attempt",
+                callCount.get() == 2);
     }
 }
