@@ -43,6 +43,13 @@ public final class RetryTest {
         testAsyncExhaustsAllAttemptsThenFailsWithLastFailure();
         testAsyncSuccessOnFirstTryCallsTaskOnce();
         testAsyncSupplierThrowingSynchronouslyIsTreatedAsFailure();
+        testMaxDelayCapsTheBackoff();
+        testMaxDelayCapsJitteredAndOverflowingDelays();
+        testInvalidMaxDelayRejected();
+        testOnRetryReportsAttemptFailureAndDelay();
+        testOnRetryNotCalledAfterFinalAttemptOrForNonRetryable();
+        testOnRetryListenerFailurePropagatesFromExecute();
+        testOnRetryWorksForAsyncAndListenerFailureCompletesTheFuture();
         TestKit.finish();
     }
 
@@ -482,5 +489,186 @@ public final class RetryTest {
                 "recovered-on-call-2".equals(result));
         TestKit.check("supplier throwing synchronously counted as an attempt",
                 callCount.get() == 2);
+    }
+
+    private static void testMaxDelayCapsTheBackoff() throws Exception {
+        java.util.List<Long> delays = new java.util.ArrayList<>();
+        Retry retry = Retry.of(6, Duration.ofMillis(10))
+                .withBackoffMultiplier(3.0)
+                .withMaxDelay(Duration.ofMillis(50))
+                .onRetry((attempt, failure, delay) -> delays.add(delay.toMillis()));
+        try {
+            retry.execute(() -> { throw new RetryableException("always"); });
+        } catch (RetryableException expected) {
+            // exhausted
+        }
+        TestKit.check("withMaxDelay caps the delay sequence (10, 30, then 50 for the rest)",
+                delays.equals(java.util.Arrays.asList(10L, 30L, 50L, 50L, 50L)));
+    }
+
+    private static void testMaxDelayCapsJitteredAndOverflowingDelays() throws Exception {
+        // Jitter can push a delay above the cap; the cap must still hold.
+        java.util.List<Long> jittered = new java.util.ArrayList<>();
+        Retry withJitter = Retry.of(30, Duration.ofMillis(1))
+                .withBackoffMultiplier(2.0)
+                .withJitter(0.5)
+                .withMaxDelay(Duration.ofMillis(5))
+                .onRetry((attempt, failure, delay) -> jittered.add(delay.toMillis()));
+        try {
+            withJitter.execute(() -> { throw new RetryableException("always"); });
+        } catch (RetryableException expected) {
+            // exhausted
+        }
+        boolean allWithinCap = true;
+        for (long d : jittered) {
+            if (d < 0 || d > 5) {
+                allWithinCap = false;
+            }
+        }
+        TestKit.check("no jittered delay exceeds withMaxDelay", jittered.size() == 29 && allWithinCap);
+
+        // multiplier^n overflows to Infinity after ~308 doublings of 10x: the cap must absorb it.
+        java.util.List<Long> overflowing = new java.util.ArrayList<>();
+        Retry overflow = Retry.of(400, Duration.ofMillis(1))
+                .withBackoffMultiplier(10.0)
+                .withMaxDelay(Duration.ofMillis(1))
+                .onRetry((attempt, failure, delay) -> overflowing.add(delay.toMillis()));
+        try {
+            overflow.execute(() -> { throw new RetryableException("always"); });
+        } catch (RetryableException expected) {
+            // exhausted
+        }
+        boolean allOne = true;
+        for (long d : overflowing) {
+            if (d != 1L) {
+                allOne = false;
+            }
+        }
+        TestKit.check("withMaxDelay keeps delays bounded even when multiplier^n overflows",
+                overflowing.size() == 399 && allOne);
+    }
+
+    private static void testInvalidMaxDelayRejected() {
+        boolean nullRejected = false;
+        boolean zeroRejected = false;
+        boolean negativeRejected = false;
+        try {
+            Retry.of(2, Duration.ofMillis(1)).withMaxDelay(null);
+        } catch (IllegalArgumentException e) {
+            nullRejected = true;
+        }
+        try {
+            Retry.of(2, Duration.ofMillis(1)).withMaxDelay(Duration.ZERO);
+        } catch (IllegalArgumentException e) {
+            zeroRejected = true;
+        }
+        try {
+            Retry.of(2, Duration.ofMillis(1)).withMaxDelay(Duration.ofMillis(-5));
+        } catch (IllegalArgumentException e) {
+            negativeRejected = true;
+        }
+        TestKit.check("withMaxDelay rejects null, zero and negative durations",
+                nullRejected && zeroRejected && negativeRejected);
+    }
+
+    private static void testOnRetryReportsAttemptFailureAndDelay() throws Exception {
+        java.util.List<Integer> attempts = new java.util.ArrayList<>();
+        java.util.List<String> messages = new java.util.ArrayList<>();
+        java.util.List<Long> delays = new java.util.ArrayList<>();
+        AtomicInteger calls = new AtomicInteger();
+
+        Retry retry = Retry.of(5, Duration.ofMillis(2))
+                .withBackoffMultiplier(2.0)
+                .onRetry((attempt, failure, delay) -> {
+                    attempts.add(attempt);
+                    messages.add(failure.getMessage());
+                    delays.add(delay.toMillis());
+                });
+        String result = retry.execute(() -> {
+            int n = calls.incrementAndGet();
+            if (n < 3) {
+                throw new RetryableException("fail-" + n);
+            }
+            return "ok";
+        });
+
+        TestKit.check("task result is returned", "ok".equals(result));
+        TestKit.check("onRetry gets the 1-based failed attempt numbers", attempts.equals(java.util.Arrays.asList(1, 2)));
+        TestKit.check("onRetry gets each attempt's failure", messages.equals(java.util.Arrays.asList("fail-1", "fail-2")));
+        TestKit.check("onRetry gets the delay about to be waited", delays.equals(java.util.Arrays.asList(2L, 4L)));
+    }
+
+    private static void testOnRetryNotCalledAfterFinalAttemptOrForNonRetryable() throws Exception {
+        AtomicInteger listenerCalls = new AtomicInteger();
+        Retry exhausting = Retry.of(3, Duration.ofMillis(1))
+                .onRetry((attempt, failure, delay) -> listenerCalls.incrementAndGet());
+        try {
+            exhausting.execute(() -> { throw new RetryableException("always"); });
+        } catch (RetryableException expected) {
+            // exhausted
+        }
+        TestKit.check("onRetry is called for attempts 1 and 2 of 3 but not after the final one",
+                listenerCalls.get() == 2);
+
+        listenerCalls.set(0);
+        Retry selective = Retry.of(3, Duration.ofMillis(1))
+                .retryOn(RetryableException.class)
+                .onRetry((attempt, failure, delay) -> listenerCalls.incrementAndGet());
+        try {
+            selective.execute(() -> { throw new NonRetryableException("nope"); });
+        } catch (NonRetryableException expected) {
+            // not retried
+        }
+        TestKit.check("onRetry is not called for a non-retryable failure", listenerCalls.get() == 0);
+    }
+
+    private static void testOnRetryListenerFailurePropagatesFromExecute() {
+        Retry retry = Retry.of(3, Duration.ofMillis(1))
+                .onRetry((attempt, failure, delay) -> { throw new IllegalStateException("listener broke"); });
+        boolean propagated = false;
+        try {
+            retry.execute(() -> { throw new RetryableException("x"); });
+        } catch (IllegalStateException e) {
+            propagated = "listener broke".equals(e.getMessage());
+        } catch (Exception other) {
+            propagated = false;
+        }
+        TestKit.check("a throwing listener aborts execute() with the listener's exception", propagated);
+    }
+
+    private static void testOnRetryWorksForAsyncAndListenerFailureCompletesTheFuture() throws Exception {
+        java.util.List<Integer> attempts = new java.util.ArrayList<>();
+        AtomicInteger calls = new AtomicInteger();
+        Retry retry = Retry.of(4, Duration.ofMillis(1))
+                .onRetry((attempt, failure, delay) -> attempts.add(attempt));
+        CompletableFuture<String> future = retry.executeAsync(() -> {
+            CompletableFuture<String> f = new CompletableFuture<>();
+            if (calls.incrementAndGet() < 3) {
+                f.completeExceptionally(new RetryableException("again"));
+            } else {
+                f.complete("done");
+            }
+            return f;
+        });
+        TestKit.check("executeAsync still succeeds with a listener", "done".equals(future.get(10, TimeUnit.SECONDS)));
+        TestKit.check("onRetry fires per async retry with 1-based attempts", attempts.equals(java.util.Arrays.asList(1, 2)));
+
+        Retry throwing = Retry.of(3, Duration.ofMillis(1))
+                .onRetry((attempt, failure, delay) -> { throw new IllegalStateException("listener broke"); });
+        CompletableFuture<String> failed = throwing.executeAsync(() -> {
+            CompletableFuture<String> f = new CompletableFuture<>();
+            f.completeExceptionally(new RetryableException("x"));
+            return f;
+        });
+        boolean completedWithListenerFailure = false;
+        try {
+            failed.get(10, TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            completedWithListenerFailure = e.getCause() instanceof IllegalStateException;
+        } catch (java.util.concurrent.TimeoutException hung) {
+            completedWithListenerFailure = false;
+        }
+        TestKit.check("a throwing listener completes the async future exceptionally instead of hanging",
+                completedWithListenerFailure);
     }
 }

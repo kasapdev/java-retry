@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.3.0] - 2026-09-20
+
+### Added
+
+- `Retry.withMaxDelay(Duration)` - caps every backoff delay (applied after the
+  multiplier and jitter). Without a cap the delay grows unboundedly and, for a
+  large multiplier or many attempts, `multiplier^n` overflows to an endless
+  wait; the cap keeps waits bounded.
+- `Retry.onRetry(RetryListener)` and the new `RetryListener` functional
+  interface - called right before each retry with the 1-based failed attempt
+  number, its failure and the delay about to be waited. Works for both
+  `execute` and `executeAsync`; not called after the final attempt or for
+  non-retryable failures. A listener that throws aborts retrying (propagated
+  by `execute`, completes the future exceptionally for `executeAsync`).
+
 ## [1.2.0] - 2026-09-07
 
 ### Added
