@@ -76,6 +76,21 @@ public class ReusablePolicyExample {
 }
 ```
 
+## Capping the delay and observing retries
+
+`withMaxDelay` keeps exponential backoff from growing past a ceiling, and
+`onRetry` is called right before each wait, which is handy for logging or
+metrics:
+
+```java
+Retry retry = Retry.of(8, Duration.ofMillis(100))
+        .withBackoffMultiplier(2.0)
+        .withMaxDelay(Duration.ofSeconds(2)) // waits: 100ms, 200ms, 400ms, 800ms, 1.6s, 2s, 2s
+        .onRetry((attempt, failure, delay) ->
+                log.warn("attempt {} failed ({}); retrying in {}", attempt, failure, delay));
+String result = retry.execute(() -> callFlakyService());
+```
+
 ## Async Retry
 
 `executeAsync(Supplier<CompletableFuture<T>>)` applies the same backoff, jitter, and
@@ -139,6 +154,8 @@ retryability check (`retryOn`) and delay computation (backoff multiplier + jitte
 | `static Retry of(int maxAttempts, Duration initialDelay)` | Creates a policy allowing up to `maxAttempts` total attempts (the first call plus retries), with `initialDelay` before the first retry. |
 | `Retry withBackoffMultiplier(double m)` | Multiplies the delay by `m` after each successive retry. Default `1.0` (constant delay). |
 | `Retry withJitter(double jitterFraction)` | Randomly adjusts each computed delay by up to `+/- jitterFraction * 100`%. Default `0.0` (no jitter). |
+| `Retry withMaxDelay(Duration maxDelay)` | Caps every backoff delay at `maxDelay` (applied after multiplier and jitter). Default: no cap. Must be positive. |
+| `Retry onRetry(RetryListener listener)` | Calls `listener.onRetry(attempt, failure, delay)` right before each retry (1-based failed attempt, its failure, the delay about to be waited) - for logging/metrics. Not called after the final attempt or for non-retryable failures. |
 | `Retry retryOn(Class<? extends Throwable>... types)` | Restricts retrying to the given exception types (and subtypes). If never called, all exceptions are retryable. |
 | `<T> T execute(Callable<T> task)` | Runs `task`, retrying on retryable failures per this policy, and returns its result on success. Throws the last failure once attempts are exhausted, or immediately if the failure type is not retryable. |
 | `<T> CompletableFuture<T> executeAsync(Supplier<CompletableFuture<T>> task)` | Async counterpart of `execute`. Invokes `task` to get a `CompletableFuture<T>` per attempt; on a retryable failure, schedules the next attempt after the computed delay without blocking a thread. Returns a future that completes with the result, or completes exceptionally once exhausted or on a non-retryable failure. |
@@ -150,6 +167,7 @@ For the delay before retry number `n` (0-indexed: `n = 0` is the delay before th
 ```
 delay = initialDelay * backoffMultiplier^n
 delay = delay * (1 + random(-jitterFraction, +jitterFraction))   // if jitter > 0
+delay = min(delay, maxDelay)                                     // if withMaxDelay(...) is set
 ```
 
 ### Behavior notes

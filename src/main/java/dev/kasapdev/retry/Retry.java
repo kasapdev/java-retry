@@ -48,6 +48,8 @@ public final class Retry {
     private final Duration initialDelay;
     private double backoffMultiplier = 1.0;
     private double jitterFraction = 0.0;
+    private Duration maxDelay = null;
+    private RetryListener retryListener = null;
     private List<Class<? extends Throwable>> retryableExceptions = Collections.emptyList();
 
     private Retry(int maxAttempts, Duration initialDelay) {
@@ -96,6 +98,33 @@ public final class Retry {
     }
 
     /**
+     * Caps every backoff delay at {@code maxDelay}, applied after the multiplier and
+     * jitter so no wait ever exceeds it. Without a cap the delay grows without bound
+     * (and, with a large multiplier or many attempts, overflows to an effectively
+     * endless wait). Default is no cap.
+     *
+     * @param maxDelay the largest delay to wait between attempts; must be positive
+     */
+    public Retry withMaxDelay(Duration maxDelay) {
+        if (maxDelay == null || maxDelay.isZero() || maxDelay.isNegative()) {
+            throw new IllegalArgumentException("maxDelay must be non-null and positive, got " + maxDelay);
+        }
+        this.maxDelay = maxDelay;
+        return this;
+    }
+
+    /**
+     * Registers a listener called right before each retry, for logging or metrics; see
+     * {@link RetryListener}. A listener that throws aborts the retrying: {@link #execute(Callable)}
+     * propagates the exception and {@link #executeAsync(Supplier)} completes exceptionally with it.
+     * Passing {@code null} removes a previously set listener.
+     */
+    public Retry onRetry(RetryListener listener) {
+        this.retryListener = listener;
+        return this;
+    }
+
+    /**
      * Restricts retrying to only the given exception types (and their subtypes).
      * If never called, or called with an empty array, all exceptions are retryable.
      */
@@ -124,7 +153,11 @@ public final class Retry {
                 if (!retryable || exhausted) {
                     rethrow(failure);
                 }
-                sleepBeforeRetry(attempt - 1);
+                long delayMillis = computeDelayMillis(attempt - 1);
+                notifyRetry(attempt, failure, delayMillis);
+                if (delayMillis > 0) {
+                    Thread.sleep(delayMillis);
+                }
             }
         }
     }
@@ -182,6 +215,14 @@ public final class Retry {
             return;
         }
         long delayMillis = computeDelayMillis(nextAttempt - 1);
+        try {
+            notifyRetry(nextAttempt, failure, delayMillis);
+        } catch (Throwable listenerFailure) {
+            // Without this the exception would vanish inside the completion callback
+            // and the caller's future would never complete.
+            resultFuture.completeExceptionally(listenerFailure);
+            return;
+        }
         Runnable nextAttemptRunnable = () -> attemptAsync(task, nextAttempt, resultFuture);
         if (delayMillis > 0) {
             CompletableFuture.runAsync(nextAttemptRunnable, CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS));
@@ -225,23 +266,26 @@ public final class Retry {
         throw new RuntimeException(failure);
     }
 
+    private void notifyRetry(int attempt, Throwable failure, long delayMillis) {
+        if (retryListener != null) {
+            retryListener.onRetry(attempt, failure, Duration.ofMillis(delayMillis));
+        }
+    }
+
     /**
      * attemptIndex is 0-based: 0 for the delay before the first retry (i.e. after
      * the 1st failed attempt), 1 for the delay before the second retry, and so on.
      */
-    private void sleepBeforeRetry(int attemptIndex) throws InterruptedException {
-        long delayMillis = computeDelayMillis(attemptIndex);
-        if (delayMillis > 0) {
-            Thread.sleep(delayMillis);
-        }
-    }
-
     private long computeDelayMillis(int attemptIndex) {
         double base = initialDelay.toMillis() * Math.pow(backoffMultiplier, attemptIndex);
         if (jitterFraction > 0) {
             double randomSign = ThreadLocalRandom.current().nextDouble(-jitterFraction, jitterFraction);
             base = base * (1.0 + randomSign);
         }
-        return Math.max(0L, Math.round(base));
+        long delayMillis = Math.max(0L, Math.round(base));
+        if (maxDelay != null) {
+            delayMillis = Math.min(delayMillis, maxDelay.toMillis());
+        }
+        return delayMillis;
     }
 }
